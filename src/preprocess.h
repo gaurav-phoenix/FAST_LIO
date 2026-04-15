@@ -16,8 +16,9 @@ enum LID_TYPE
   AVIA = 1,
   VELO16,
   OUST64,
-  MID360
-};  //{1, 2, 3}
+  MID360,
+  GENERIC_RING
+};  // 1=Livox CustomMsg, 2=Velodyne-style PointCloud2, 3=Ouster PointCloud2, 4=Mid360-style PointCloud2 with Livox-specific fields, 5=generic PointCloud2 with x/y/z/intensity/ring
 enum TIME_UNIT
 {
   SEC = 0,
@@ -132,6 +133,29 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(livox_ros::LivoxPointXyzrtl,
     (uint8_t, line, line)
 )
 
+namespace generic_ring_ros
+{
+struct EIGEN_ALIGN16 Point
+{
+  PCL_ADD_POINT4D;
+  float intensity;
+  // Gazebo's organized PointCloud2 leaves 4 bytes between intensity (offset 16)
+  // and ring (offset 24). Keep that layout so ring is read from the correct field.
+  float padding;
+  uint16_t ring;
+  uint16_t reserved;
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+};
+}  // namespace generic_ring_ros
+
+POINT_CLOUD_REGISTER_POINT_STRUCT(generic_ring_ros::Point,
+    (float, x, x)
+    (float, y, y)
+    (float, z, z)
+    (float, intensity, intensity)
+    (uint16_t, ring, ring)
+)
+
 class Preprocess
 {
   public:
@@ -159,6 +183,7 @@ private:
   void oust64_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg);
   void velodyne_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg);
   void mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg);
+  void generic_ring_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg);
   void default_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg);
   void give_feature(PointCloudXYZI &pl, vector<orgtype> &types);
   void pub_func(PointCloudXYZI &pl, const rclcpp::Time &ct);
