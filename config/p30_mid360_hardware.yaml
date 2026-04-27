@@ -29,6 +29,9 @@
             b_gyr_cov: 0.0001
             fov_degree:    360.0
             det_range:     100.0
+            # This is LiDAR-to-Mid360-internal-IMU calibration, not the
+            # physical 47° drone mount. The drone mount belongs in a separate
+            # sensor-to-airframe TF.
             extrinsic_est_en:  true
             extrinsic_T: [ -0.011, -0.02329, 0.04412 ]
             extrinsic_R: [ 1., 0., 0.,
