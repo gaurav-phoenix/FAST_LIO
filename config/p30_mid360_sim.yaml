@@ -1,0 +1,55 @@
+/**:
+    ros__parameters:
+        feature_extract_enable: false
+        point_filter_num: 1
+        max_iteration: 3
+        filter_size_surf: 0.8
+        filter_size_map: 1.0
+
+        cube_side_length: 1000.0
+        runtime_pos_log_enable: false
+        map_file_path: "./p30_fastlio_map.pcd"
+
+        common:
+            lid_topic: "/slam/point_cloud"
+            imu_topic: "/slam/imu"
+            time_sync_en: false
+            time_offset_lidar_to_imu: 0.0
+
+        preprocess:
+            # Gazebo publishes a generic PointCloud2 with x/y/z/intensity/ring.
+            # Use the generic ring-aware path so FAST-LIO can reconstruct
+            # intra-scan timing from azimuth ordering without expecting a
+            # Velodyne/Livox-specific point layout.
+            lidar_type: 5
+            scan_line: 56
+            blind: 2.0
+            timestamp_unit: 3
+            scan_rate: 10
+
+        mapping:
+            acc_cov: 0.1
+            gyr_cov: 0.1
+            b_acc_cov: 0.0001
+            b_gyr_cov: 0.0001
+            fov_degree: 360.0
+            det_range: 100.0
+            # The simulated LiDAR mount is fixed and known. Estimating it online
+            # with mismatched/sparse scan constraints only destabilizes the filter.
+            extrinsic_est_en: false
+            extrinsic_T: [0.0, 0.0, -0.06]
+            extrinsic_R: [0.6820018328420315, 0.0, 0.7313504631844501,
+                          0.0, 1.0, 0.0,
+                          -0.7313504631844501, 0.0, 0.6820018328420315]
+
+        publish:
+            path_en: true
+            effect_map_en: false
+            map_en: true
+            scan_publish_en: true
+            dense_publish_en: false
+            scan_bodyframe_pub_en: true
+
+        pcd_save:
+            pcd_save_en: true
+            interval: -1

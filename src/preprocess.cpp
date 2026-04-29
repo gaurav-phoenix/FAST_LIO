@@ -1,9 +1,127 @@
 #include "preprocess.h"
 
+#include <cstring>
+#include <limits>
+#include <string>
+
 #include <pcl/common/common.h>
 
 #define RETURN0 0x00
 #define RETURN0AND1 0x10
+
+namespace
+{
+
+const sensor_msgs::msg::PointField * find_point_field(
+  const sensor_msgs::msg::PointCloud2 & msg,
+  const std::string & name)
+{
+  for (const auto & field : msg.fields)
+  {
+    if (field.name == name)
+    {
+      return &field;
+    }
+  }
+  return nullptr;
+}
+
+std::string point_field_names(const sensor_msgs::msg::PointCloud2 & msg)
+{
+  std::string names;
+  for (size_t i = 0; i < msg.fields.size(); ++i)
+  {
+    if (i != 0)
+    {
+      names += ", ";
+    }
+    names += msg.fields[i].name;
+  }
+  return names;
+}
+
+bool read_ring_value(
+  const sensor_msgs::msg::PointCloud2 & msg,
+  size_t point_index,
+  const sensor_msgs::msg::PointField & field,
+  uint16_t & out)
+{
+  if (msg.width == 0 || msg.point_step == 0)
+  {
+    return false;
+  }
+
+  const size_t row = point_index / msg.width;
+  const size_t col = point_index % msg.width;
+  const size_t base = row * msg.row_step + col * msg.point_step + field.offset;
+  if (base >= msg.data.size())
+  {
+    return false;
+  }
+
+  const auto * data = msg.data.data() + base;
+  switch (field.datatype)
+  {
+    case sensor_msgs::msg::PointField::UINT8:
+    {
+      uint8_t value = 0;
+      std::memcpy(&value, data, sizeof(value));
+      out = static_cast<uint16_t>(value);
+      return true;
+    }
+    case sensor_msgs::msg::PointField::INT8:
+    {
+      int8_t value = 0;
+      std::memcpy(&value, data, sizeof(value));
+      if (value < 0)
+      {
+        return false;
+      }
+      out = static_cast<uint16_t>(value);
+      return true;
+    }
+    case sensor_msgs::msg::PointField::UINT16:
+      std::memcpy(&out, data, sizeof(out));
+      return true;
+    case sensor_msgs::msg::PointField::INT16:
+    {
+      int16_t value = 0;
+      std::memcpy(&value, data, sizeof(value));
+      if (value < 0)
+      {
+        return false;
+      }
+      out = static_cast<uint16_t>(value);
+      return true;
+    }
+    case sensor_msgs::msg::PointField::UINT32:
+    {
+      uint32_t value = 0;
+      std::memcpy(&value, data, sizeof(value));
+      if (value > std::numeric_limits<uint16_t>::max())
+      {
+        return false;
+      }
+      out = static_cast<uint16_t>(value);
+      return true;
+    }
+    case sensor_msgs::msg::PointField::INT32:
+    {
+      int32_t value = 0;
+      std::memcpy(&value, data, sizeof(value));
+      if (value < 0 || value > std::numeric_limits<uint16_t>::max())
+      {
+        return false;
+      }
+      out = static_cast<uint16_t>(value);
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
+}  // namespace
 
 Preprocess::Preprocess() : feature_enabled(0), lidar_type(AVIA), blind(0.01), point_filter_num(1)
 {
@@ -83,6 +201,10 @@ void Preprocess::process(const sensor_msgs::msg::PointCloud2::UniquePtr &msg, Po
 
     case MID360:
       mid360_handler(msg);
+      break;
+
+    case GENERIC_RING:
+      generic_ring_handler(msg);
       break;
 
     default:
@@ -351,6 +473,12 @@ void Preprocess::velodyne_handler(const sensor_msgs::msg::PointCloud2::UniquePtr
       int layer = pl_orig.points[i].ring;
       if (layer >= N_SCANS)
         continue;
+      if (!std::isfinite(pl_orig.points[i].x) ||
+        !std::isfinite(pl_orig.points[i].y) ||
+        !std::isfinite(pl_orig.points[i].z))
+      {
+        continue;
+      }
       added_pt.x = pl_orig.points[i].x;
       added_pt.y = pl_orig.points[i].y;
       added_pt.z = pl_orig.points[i].z;
@@ -552,6 +680,254 @@ void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
     if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
     {
       pl_surf.push_back(std::move(added_pt));
+    }
+  }
+}
+
+void Preprocess::generic_ring_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg)
+{
+  pl_surf.clear();
+  pl_corn.clear();
+  pl_full.clear();
+
+  static bool layout_logged = false;
+  static bool ring_mode_logged = false;
+  const auto logger = rclcpp::get_logger("fast_lio.preprocess");
+
+  if (!layout_logged)
+  {
+    RCLCPP_INFO(
+      logger,
+      "FAST-LIO generic-ring input: width=%u height=%u point_step=%u row_step=%u fields=[%s]",
+      msg->width,
+      msg->height,
+      msg->point_step,
+      msg->row_step,
+      point_field_names(*msg).c_str());
+    layout_logged = true;
+  }
+
+  const auto * ring_field = find_point_field(*msg, "ring");
+  if (ring_field == nullptr)
+  {
+    RCLCPP_ERROR(
+      logger,
+      "FAST-LIO generic-ring input is missing the 'ring' field; refusing to process this cloud");
+    return;
+  }
+
+  const size_t raw_point_count = static_cast<size_t>(msg->width) * static_cast<size_t>(msg->height);
+  if (raw_point_count == 0)
+  {
+    RCLCPP_WARN(logger, "FAST-LIO generic-ring input is empty");
+    return;
+  }
+
+  uint16_t min_ring = std::numeric_limits<uint16_t>::max();
+  uint16_t max_ring = 0;
+  std::vector<bool> seen_rings(std::max(N_SCANS, 1), false);
+  size_t unique_ring_count = 0;
+  for (size_t i = 0; i < raw_point_count; ++i)
+  {
+    uint16_t ring_value = 0;
+    if (!read_ring_value(*msg, i, *ring_field, ring_value))
+    {
+      RCLCPP_ERROR(
+        logger,
+        "FAST-LIO generic-ring input has an invalid or unsupported ring datatype; refusing to process this cloud");
+      return;
+    }
+
+    min_ring = std::min(min_ring, ring_value);
+    max_ring = std::max(max_ring, ring_value);
+    if (ring_value < seen_rings.size() && !seen_rings[ring_value])
+    {
+      seen_rings[ring_value] = true;
+      ++unique_ring_count;
+    }
+    else if (ring_value >= seen_rings.size())
+    {
+      RCLCPP_ERROR(
+        logger,
+        "FAST-LIO generic-ring input ring index %u exceeds configured scan_line=%d; refusing to process this cloud",
+        ring_value,
+        N_SCANS);
+      return;
+    }
+  }
+
+  if (!ring_mode_logged)
+  {
+    RCLCPP_INFO(
+      logger,
+      "FAST-LIO generic-ring diagnostics: observed ring range [%u, %u], unique_rings=%zu, configured scan_line=%d",
+      min_ring,
+      max_ring,
+      unique_ring_count,
+      N_SCANS);
+    ring_mode_logged = true;
+  }
+
+  if (unique_ring_count < 2)
+  {
+    RCLCPP_ERROR(
+      logger,
+      "FAST-LIO generic-ring input only populated %zu scan lines; refusing to process this cloud",
+      unique_ring_count);
+    return;
+  }
+
+  if (min_ring != 0 || max_ring + 1 != static_cast<uint16_t>(N_SCANS) || unique_ring_count != static_cast<size_t>(N_SCANS))
+  {
+    RCLCPP_WARN(
+      logger,
+      "FAST-LIO generic-ring input does not fully match configured scan_line=%d (min_ring=%u, max_ring=%u, unique_rings=%zu)",
+      N_SCANS,
+      min_ring,
+      max_ring,
+      unique_ring_count);
+  }
+
+  pcl::PointCloud<generic_ring_ros::Point> pl_orig;
+  pcl::fromROSMsg(*msg, pl_orig);
+  int plsize = pl_orig.points.size();
+  if (plsize == 0)
+    return;
+  pl_surf.reserve(plsize);
+
+  double omega_l = 0.361 * SCAN_RATE;  // scan angular velocity
+  std::vector<bool> is_first(N_SCANS, true);
+  std::vector<double> yaw_fp(N_SCANS, 0.0);
+  std::vector<float> yaw_last(N_SCANS, 0.0);
+  std::vector<float> time_last(N_SCANS, 0.0);
+
+  if (feature_enabled)
+  {
+    for (int i = 0; i < N_SCANS; i++)
+    {
+      pl_buff[i].clear();
+      pl_buff[i].reserve(plsize);
+    }
+
+    for (int i = 0; i < plsize; i++)
+    {
+      PointType added_pt;
+      added_pt.normal_x = 0;
+      added_pt.normal_y = 0;
+      added_pt.normal_z = 0;
+      int layer = pl_orig.points[i].ring;
+      if (layer >= N_SCANS)
+        continue;
+      added_pt.x = pl_orig.points[i].x;
+      added_pt.y = pl_orig.points[i].y;
+      added_pt.z = pl_orig.points[i].z;
+      added_pt.intensity = pl_orig.points[i].intensity;
+      added_pt.curvature = 0.0f;
+
+      double yaw_angle = atan2(added_pt.y, added_pt.x) * 57.2957;
+      if (is_first[layer])
+      {
+        yaw_fp[layer] = yaw_angle;
+        is_first[layer] = false;
+        yaw_last[layer] = yaw_angle;
+        time_last[layer] = 0.0f;
+        continue;
+      }
+
+      if (yaw_angle <= yaw_fp[layer])
+      {
+        added_pt.curvature = (yaw_fp[layer] - yaw_angle) / omega_l;
+      }
+      else
+      {
+        added_pt.curvature = (yaw_fp[layer] - yaw_angle + 360.0) / omega_l;
+      }
+
+      if (added_pt.curvature < time_last[layer])
+        added_pt.curvature += 360.0 / omega_l;
+
+      yaw_last[layer] = yaw_angle;
+      time_last[layer] = added_pt.curvature;
+      pl_buff[layer].points.push_back(added_pt);
+    }
+
+    for (int j = 0; j < N_SCANS; j++)
+    {
+      PointCloudXYZI& pl = pl_buff[j];
+      int linesize = pl.size();
+      if (linesize < 2)
+        continue;
+      vector<orgtype>& types = typess[j];
+      types.clear();
+      types.resize(linesize);
+      linesize--;
+      for (uint i = 0; i < linesize; i++)
+      {
+        types[i].range = sqrt(pl[i].x * pl[i].x + pl[i].y * pl[i].y);
+        vx = pl[i].x - pl[i + 1].x;
+        vy = pl[i].y - pl[i + 1].y;
+        vz = pl[i].z - pl[i + 1].z;
+        types[i].dista = vx * vx + vy * vy + vz * vz;
+      }
+      types[linesize].range = sqrt(pl[linesize].x * pl[linesize].x + pl[linesize].y * pl[linesize].y);
+      give_feature(pl, types);
+    }
+  }
+  else
+  {
+    for (int i = 0; i < plsize; i++)
+    {
+      PointType added_pt;
+      added_pt.normal_x = 0;
+      added_pt.normal_y = 0;
+      added_pt.normal_z = 0;
+
+      int layer = pl_orig.points[i].ring;
+      if (layer >= N_SCANS)
+        continue;
+      if (!std::isfinite(pl_orig.points[i].x) ||
+        !std::isfinite(pl_orig.points[i].y) ||
+        !std::isfinite(pl_orig.points[i].z))
+      {
+        continue;
+      }
+
+      added_pt.x = pl_orig.points[i].x;
+      added_pt.y = pl_orig.points[i].y;
+      added_pt.z = pl_orig.points[i].z;
+      added_pt.intensity = pl_orig.points[i].intensity;
+      added_pt.curvature = 0.0f;
+
+      double yaw_angle = atan2(added_pt.y, added_pt.x) * 57.2957;
+      if (is_first[layer])
+      {
+        yaw_fp[layer] = yaw_angle;
+        is_first[layer] = false;
+        yaw_last[layer] = yaw_angle;
+        time_last[layer] = 0.0f;
+        continue;
+      }
+
+      if (yaw_angle <= yaw_fp[layer])
+      {
+        added_pt.curvature = (yaw_fp[layer] - yaw_angle) / omega_l;
+      }
+      else
+      {
+        added_pt.curvature = (yaw_fp[layer] - yaw_angle + 360.0) / omega_l;
+      }
+
+      if (added_pt.curvature < time_last[layer])
+        added_pt.curvature += 360.0 / omega_l;
+
+      yaw_last[layer] = yaw_angle;
+      time_last[layer] = added_pt.curvature;
+
+      if (i % point_filter_num == 0 &&
+          added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
+      {
+        pl_surf.points.push_back(added_pt);
+      }
     }
   }
 }
