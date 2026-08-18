@@ -37,10 +37,22 @@
             # The simulated LiDAR mount is fixed and known. Estimating it online
             # with mismatched/sparse scan constraints only destabilizes the filter.
             extrinsic_est_en: false
-            extrinsic_T: [0.0, 0.0, -0.06]
-            extrinsic_R: [0.6820018328420315, 0.0, 0.7313504631844501,
-                          0.0, 1.0, 0.0,
-                          -0.7313504631844501, 0.0, 0.6820018328420315]
+            # Lidar pose expressed in the IMU (p30_base/body) frame. Must match
+            # models/x500_livox_mid360/model.sdf and the p30_base ->
+            # p30_mid360_lidar static TF in sim_world.launch.py, which are the
+            # single source of truth for the mount:
+            #   xyz (0.15901, 0, 0.03052), quat xyzw
+            #   (0.259195581, 0.259195581, 0.657888783, 0.657888783)
+            #
+            # The previous value was a pure 47 deg pitch at (0, 0, -0.06): the
+            # complement of the real 43 deg roll, applied about the wrong axis,
+            # with the 90 deg yaw dropped. Net error 90.07 deg, so every scan
+            # was registered a quarter turn away from where the filter believed
+            # it pointed -- "No Effective Points!" and steady odometry drift.
+            extrinsic_T: [0.15901, 0.0, 0.03052]
+            extrinsic_R: [0.0, -0.731270603, 0.682087461,
+                          1.0, 0.0, 0.0,
+                          0.0, 0.682087461, 0.731270603]
 
         publish:
             path_en: true
