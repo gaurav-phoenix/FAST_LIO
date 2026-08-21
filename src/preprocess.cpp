@@ -795,11 +795,50 @@ void Preprocess::generic_ring_handler(const sensor_msgs::msg::PointCloud2::Uniqu
     return;
   pl_surf.reserve(plsize);
 
-  double omega_l = 0.361 * SCAN_RATE;  // scan angular velocity
-  std::vector<bool> is_first(N_SCANS, true);
-  std::vector<double> yaw_fp(N_SCANS, 0.0);
-  std::vector<float> yaw_last(N_SCANS, 0.0);
-  std::vector<float> time_last(N_SCANS, 0.0);
+  // Intra-scan point times are left at zero on this path: the ring-structured
+  // clouds it serves carry no per-point time field, and there is no way to
+  // recover one from geometry alone.
+  //
+  // What used to be here was the Velodyne recipe -- derive each point's time
+  // from its azimuth, assuming a beam sweeping at omega_l = 0.361 * SCAN_RATE
+  // deg/ms:
+  //     curvature = (yaw_first - yaw) / omega_l           (+360/omega_l if it
+  //                                                        went backwards)
+  // That is only meaningful for a sensor whose azimuth advances with time. Our
+  // producer is a Gazebo <gpu_lidar> (models/livox_mid360/model.sdf: 360x56
+  // samples at 10 Hz), which renders every ray of the frame in ONE GPU pass at
+  // ONE instant. Its points are simultaneous, so the true intra-scan offset is
+  // zero for all of them.
+  //
+  // Measured on rosbags/test_kino_global_route_3d_nomap_20260819_115406, the
+  // formula was not merely approximate, it was inverted: the sim sweeps azimuth
+  // *upward* (99.5% of consecutive points increase), so yaw_first - yaw is
+  // negative and every point took the +360 branch. Result per scan:
+  //   * synthesized offsets spanned 99.45..198.89 ms, with 99% of points placed
+  //     BEYOND the 100 ms scan period -- up to two full periods late;
+  //   * correlation with true acquisition order was +0.12 (should be +1.0);
+  //   * points.back().curvature had a median of 145.6 ms, and laserMapping.cpp
+  //     sets lidar_end_time = lidar_beg_time + that, so a 100 ms scan was
+  //     believed to span ~146 ms (p10 99.7, p90 161.1).
+  //
+  // Downstream, IMU_Processing sorts by curvature and back-propagates each
+  // point to the frame-end pose over that interval, so every point received a
+  // rigid de-skew drawn from ~150 ms of body motion that it never experienced,
+  // and the ESIKF registered each scan against a state propagated ~46 ms past
+  // the instant the scan was actually taken. Both errors scale with body
+  // motion, which is why the drift was proportional to distance flown rather
+  // than to time: 5.2 cm per metre, linear over the whole flight. The smeared
+  // scans went into the ikd-tree, so the corruption outlived the motion --
+  // parked and with a flat IMU the pose still slid +0.6 m/s through its own
+  // bad map, then ran away to x = +190 m.
+  //
+  // With curvature left at 0, points.back().curvature is 0, sync_packages
+  // keeps lidar_end_time == lidar_beg_time, and the undistortion loop's
+  // guard (curvature/1000 > head->offset_time) is false for every point, so
+  // de-skew is a clean no-op and the scan is registered at the instant it was
+  // taken. A sensor on this path that really does sweep must publish a per-
+  // point time field and use a handler that reads it -- which is what the real
+  // Mid360 already does (p30_mid360_hardware.yaml uses lidar_type 4).
 
   if (feature_enabled)
   {
@@ -822,32 +861,7 @@ void Preprocess::generic_ring_handler(const sensor_msgs::msg::PointCloud2::Uniqu
       added_pt.y = pl_orig.points[i].y;
       added_pt.z = pl_orig.points[i].z;
       added_pt.intensity = pl_orig.points[i].intensity;
-      added_pt.curvature = 0.0f;
-
-      double yaw_angle = atan2(added_pt.y, added_pt.x) * 57.2957;
-      if (is_first[layer])
-      {
-        yaw_fp[layer] = yaw_angle;
-        is_first[layer] = false;
-        yaw_last[layer] = yaw_angle;
-        time_last[layer] = 0.0f;
-        continue;
-      }
-
-      if (yaw_angle <= yaw_fp[layer])
-      {
-        added_pt.curvature = (yaw_fp[layer] - yaw_angle) / omega_l;
-      }
-      else
-      {
-        added_pt.curvature = (yaw_fp[layer] - yaw_angle + 360.0) / omega_l;
-      }
-
-      if (added_pt.curvature < time_last[layer])
-        added_pt.curvature += 360.0 / omega_l;
-
-      yaw_last[layer] = yaw_angle;
-      time_last[layer] = added_pt.curvature;
+      added_pt.curvature = 0.0f;   // simultaneous samples; see note above
       pl_buff[layer].points.push_back(added_pt);
     }
 
@@ -896,32 +910,7 @@ void Preprocess::generic_ring_handler(const sensor_msgs::msg::PointCloud2::Uniqu
       added_pt.y = pl_orig.points[i].y;
       added_pt.z = pl_orig.points[i].z;
       added_pt.intensity = pl_orig.points[i].intensity;
-      added_pt.curvature = 0.0f;
-
-      double yaw_angle = atan2(added_pt.y, added_pt.x) * 57.2957;
-      if (is_first[layer])
-      {
-        yaw_fp[layer] = yaw_angle;
-        is_first[layer] = false;
-        yaw_last[layer] = yaw_angle;
-        time_last[layer] = 0.0f;
-        continue;
-      }
-
-      if (yaw_angle <= yaw_fp[layer])
-      {
-        added_pt.curvature = (yaw_fp[layer] - yaw_angle) / omega_l;
-      }
-      else
-      {
-        added_pt.curvature = (yaw_fp[layer] - yaw_angle + 360.0) / omega_l;
-      }
-
-      if (added_pt.curvature < time_last[layer])
-        added_pt.curvature += 360.0 / omega_l;
-
-      yaw_last[layer] = yaw_angle;
-      time_last[layer] = added_pt.curvature;
+      added_pt.curvature = 0.0f;   // simultaneous samples; see note above
 
       if (i % point_filter_num == 0 &&
           added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))

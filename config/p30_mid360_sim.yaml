@@ -23,7 +23,24 @@
             # Velodyne/Livox-specific point layout.
             lidar_type: 5
             scan_line: 56
-            blind: 2.0
+            # Radius, metres: FAST-LIO discards every return inside it
+            # (preprocess.cpp tests x^2+y^2+z^2 > blind^2). 2.0 came in with the
+            # lidar_type 5 generic-ring template, which is Velodyne-derived, and
+            # is wrong for a Mid360 on a drone: p30_mid360_hardware.yaml and
+            # upstream mid360.yaml both use 0.5 for this same sensor.
+            #
+            # Measured from rosbags/kino3d_20260819_112306: flying the maze the
+            # median return is 1.8 m and drops to 1.3 m on descent, so 2.0
+            # threw away 66% of every scan -- and specifically the near returns
+            # that constrain the solution best. Retained fraction falls off a
+            # cliff right at this value: 0.3/0.5/0.7/1.0 all keep 93%, 1.5 keeps
+            # 88%, 2.0 keeps 34%. FAST-LIO then lost constraint and ran away to
+            # -23 km in Z while PX4 held station, PGO followed it, and the
+            # global map filled with garbage.
+            #
+            # 0.5 sits just outside the airframe (planning_cloud_adapter
+            # self_radius is 0.45) and clear of the cliff.
+            blind: 0.5
             timestamp_unit: 3
             scan_rate: 10
 
