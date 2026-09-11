@@ -85,6 +85,18 @@ find_package(PCL REQUIRED COMPONENTS common io)
 message(Eigen: ${EIGEN3_INCLUDE_DIR})
 message(STATUS "PCL: ${PCL_INCLUDE_DIRS}")
 
+set(IKD_TREE_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include")
+set(IKD_TREE_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/include/ikd-Tree/ikd_Tree.cpp")
+if(NOT EXISTS "${IKD_TREE_SOURCE}")
+  set(IKD_TREE_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../ikd-Tree")
+  set(IKD_TREE_SOURCE "${IKD_TREE_INCLUDE_DIR}/ikd-Tree/ikd_Tree.cpp")
+endif()
+if(NOT EXISTS "${IKD_TREE_SOURCE}")
+  message(FATAL_ERROR
+    "ikd-Tree source not found. Expected embedded include/ikd-Tree or sibling ../ikd-Tree checkout.")
+endif()
+message(STATUS "ikd-Tree source: ${IKD_TREE_SOURCE}")
+
 set(msg_files
   "msg/Pose6D.msg"
 )
@@ -94,10 +106,11 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 )
 ament_export_dependencies(rosidl_default_runtime)
 
-add_executable(fastlio_mapping src/laserMapping.cpp include/ikd-Tree/ikd_Tree.cpp src/preprocess.cpp)
+add_executable(fastlio_mapping src/laserMapping.cpp ${IKD_TREE_SOURCE} src/preprocess.cpp)
 target_include_directories(fastlio_mapping PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
+  ${IKD_TREE_INCLUDE_DIR}
   ${PCL_INCLUDE_DIRS}
 )
 target_link_libraries(fastlio_mapping ${PCL_LIBRARIES} ${PYTHON_LIBRARIES} Eigen3::Eigen)
