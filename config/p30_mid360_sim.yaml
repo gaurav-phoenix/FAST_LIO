@@ -2,9 +2,11 @@
     ros__parameters:
         feature_extract_enable: false
         point_filter_num: 1
-        max_iteration: 3
-        filter_size_surf: 0.8
-        filter_size_map: 1.0
+        max_iteration: 4
+        # Preserve nearby wall/corner constraints in the indoor maze. Validate
+        # processing cadence after changes: finer voxels increase scan work.
+        filter_size_surf: 0.3
+        filter_size_map: 0.3
 
         cube_side_length: 1000.0
         runtime_pos_log_enable: false
@@ -18,9 +20,8 @@
 
         preprocess:
             # Gazebo publishes a generic PointCloud2 with x/y/z/intensity/ring.
-            # Use the generic ring-aware path so FAST-LIO can reconstruct
-            # intra-scan timing from azimuth ordering without expecting a
-            # Velodyne/Livox-specific point layout.
+            # Generic ring input uses simultaneous samples (zero time offsets)
+            # for Gazebo's instantaneous scan; do not synthesize azimuth times.
             lidar_type: 5
             scan_line: 56
             # Radius, metres: FAST-LIO discards every return inside it
