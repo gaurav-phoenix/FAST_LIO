@@ -8,6 +8,11 @@
         filter_size_map: 0.2
         cube_side_length: 1000.0
         runtime_pos_log_enable: false
+        # Test 1 replay on Orin: three matching threads plus prompt sensor reception.
+        diagnostics:
+            enabled: true
+        sensor_callbacks:
+            concurrent: true
         map_file_path: "./p30_hardware_map.pcd"
 
         common:

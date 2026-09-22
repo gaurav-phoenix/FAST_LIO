@@ -34,6 +34,7 @@
 // POSSIBILITY OF SUCH DAMAGE.
 #include <omp.h>
 #include <mutex>
+#include <atomic>
 #include <math.h>
 #include <thread>
 #include <fstream>
@@ -83,6 +84,7 @@ const float MOV_THRESHOLD = 1.5f;
 double time_diff_lidar_to_imu = 0.0;
 
 mutex mtx_buffer;
+mutex mtx_diag;
 condition_variable sig_buffer;
 
 string root_dir = ROOT_DIR;
@@ -93,7 +95,8 @@ double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
 double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
 double filter_size_corner_min = 0, filter_size_surf_min = 0, filter_size_map_min = 0, fov_deg = 0;
 double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, total_distance = 0, lidar_end_time = 0, first_lidar_time = 0.0;
-int    effct_feat_num = 0, time_log_counter = 0, scan_count = 0, publish_count = 0;
+int    effct_feat_num = 0, time_log_counter = 0, scan_count = 0;
+std::atomic<int> publish_count{0};
 int    iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudValidNum = 0, pcd_save_interval = -1, pcd_index = 0;
 bool   point_selected_surf[100000] = {0};
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
@@ -302,19 +305,38 @@ bool diagnostics_enabled = false;
 InputDiagnostic diag_imu, diag_cloud;
 unsigned long diag_wait_empty = 0, diag_wait_imu = 0, diag_synced = 0;
 double diag_timer_max = 0, diag_map_max = 0, diag_preprocess_max = 0;
+struct StageTiming {
+    double total = 0, maximum = 0;
+    unsigned long count = 0;
+    void add(double seconds) {
+        if (!diagnostics_enabled) return;
+        total += seconds;
+        maximum = std::max(maximum, seconds);
+        ++count;
+    }
+    double mean() const { return count ? total / count : 0; }
+    void reset() { total = maximum = 0; count = 0; }
+};
+StageTiming stage_imu, stage_fov, stage_voxel, stage_match, stage_insert, stage_publish;
 struct DiagnosticDuration {
     double &maximum;
     double start;
     explicit DiagnosticDuration(double &target) : maximum(target), start(omp_get_wtime()) {}
     ~DiagnosticDuration() {
-        if (diagnostics_enabled) maximum = std::max(maximum, omp_get_wtime() - start);
+        if (diagnostics_enabled) {
+            std::lock_guard<std::mutex> lock(mtx_diag);
+            maximum = std::max(maximum, omp_get_wtime() - start);
+        }
     }
 };
 
 void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg) 
 {
     DiagnosticDuration duration(diag_preprocess_max);
-    if (diagnostics_enabled) diag_cloud.observe(get_time_sec(msg->header.stamp));
+    if (diagnostics_enabled) {
+        std::lock_guard<std::mutex> lock(mtx_diag);
+        diag_cloud.observe(get_time_sec(msg->header.stamp));
+    }
     mtx_buffer.lock();
     scan_count ++;
     double cur_time = get_time_sec(msg->header.stamp);
@@ -339,12 +361,15 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
     sig_buffer.notify_all();
 }
 
-double timediff_lidar_wrt_imu = 0.0;
+std::atomic<double> timediff_lidar_wrt_imu{0.0};
 bool   timediff_set_flg = false;
 void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg) 
 {
     DiagnosticDuration duration(diag_preprocess_max);
-    if (diagnostics_enabled) diag_cloud.observe(get_time_sec(msg->header.stamp));
+    if (diagnostics_enabled) {
+        std::lock_guard<std::mutex> lock(mtx_diag);
+        diag_cloud.observe(get_time_sec(msg->header.stamp));
+    }
     mtx_buffer.lock();
     double cur_time = get_time_sec(msg->header.stamp);
     double preprocess_start_time = omp_get_wtime();
@@ -369,7 +394,7 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     {
         timediff_set_flg = true;
         timediff_lidar_wrt_imu = last_timestamp_lidar + 0.1 - last_timestamp_imu;
-        printf("Self sync IMU and LiDAR, time diff is %.10lf \n", timediff_lidar_wrt_imu);
+        printf("Self sync IMU and LiDAR, time diff is %.10lf \n", timediff_lidar_wrt_imu.load());
     }
 
     PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
@@ -384,17 +409,20 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
 
 void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 {
-    if (diagnostics_enabled) diag_imu.observe(get_time_sec(msg_in->header.stamp));
+    if (diagnostics_enabled) {
+        std::lock_guard<std::mutex> lock(mtx_diag);
+        diag_imu.observe(get_time_sec(msg_in->header.stamp));
+    }
     publish_count ++;
     // cout<<"IMU got at: "<<msg_in->header.stamp.toSec()<<endl;
     sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
     
 
     msg->header.stamp = get_ros_time(get_time_sec(msg_in->header.stamp) - time_diff_lidar_to_imu);
-    if (abs(timediff_lidar_wrt_imu) > 0.1 && time_sync_en)
+    if (abs(timediff_lidar_wrt_imu.load()) > 0.1 && time_sync_en)
     {
         msg->header.stamp = \
-        rclcpp::Time(timediff_lidar_wrt_imu + get_time_sec(msg_in->header.stamp));
+        rclcpp::Time(timediff_lidar_wrt_imu.load() + get_time_sec(msg_in->header.stamp));
     }
 
     double timestamp = get_time_sec(msg->header.stamp);
@@ -418,6 +446,8 @@ double lidar_mean_scantime = 0.0;
 int    scan_num = 0;
 bool sync_packages(MeasureGroup &meas)
 {
+    // Sensor callbacks may run on a separate executor thread.
+    std::lock_guard<std::mutex> lock(mtx_buffer);
     if (lidar_buffer.empty() || imu_buffer.empty()) {
         if (diagnostics_enabled) ++diag_wait_empty;
         return false;
@@ -853,6 +883,12 @@ public:
     LaserMappingNode(const rclcpp::NodeOptions& options = rclcpp::NodeOptions()) : Node("laser_mapping", options)
     {
         diagnostics_enabled = this->declare_parameter<bool>("diagnostics.enabled", false);
+        separate_sensor_callbacks_ = this->declare_parameter<bool>("sensor_callbacks.concurrent", false);
+        if (separate_sensor_callbacks_) {
+            sensor_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        }
+        rclcpp::SubscriptionOptions sensor_options;
+        sensor_options.callback_group = sensor_group_;
         this->declare_parameter<bool>("publish.path_en", true);
         this->declare_parameter<bool>("publish.effect_map_en", false);
         this->declare_parameter<bool>("publish.map_en", false);
@@ -978,13 +1014,13 @@ public:
         /*** ROS subscribe initialization ***/
         if (p_pre->lidar_type == AVIA)
         {
-            sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 20, livox_pcl_cbk);
+            sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 20, livox_pcl_cbk, sensor_options);
         }
         else
         {
-            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
+            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk, sensor_options);
         }
-        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
+        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk, sensor_options);
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
@@ -1005,6 +1041,8 @@ public:
         RCLCPP_INFO(this->get_logger(), "Node init finished.");
     }
 
+    bool separate_sensor_callbacks() const { return separate_sensor_callbacks_; }
+
     ~LaserMappingNode()
     {
         fout_out.close();
@@ -1019,6 +1057,8 @@ private:
         const double diagnostic_now = omp_get_wtime();
         static double diagnostic_last = diagnostic_now;
         if (diagnostics_enabled && diagnostic_now - diagnostic_last >= 1.0) {
+            std::lock_guard<std::mutex> diag_lock(mtx_diag);
+            std::lock_guard<std::mutex> buffer_lock(mtx_buffer);
             RCLCPP_INFO(this->get_logger(),
                 "LIO_DIAG interval_s=%.3f imu_total=%lu cloud_total=%lu "
                 "imu_age_max_s=%.6f cloud_age_max_s=%.6f "
@@ -1027,7 +1067,10 @@ private:
                 "imu_backwards=%lu cloud_backwards=%lu imu_queue=%zu cloud_queue=%zu "
                 "time_queue=%zu imu_end_deficit_s=%.6f "
                 "wait_empty=%lu wait_imu=%lu synced=%lu "
-                "processing_max_s=%.6f map_callback_max_s=%.6f preprocess_max_s=%.6f",
+                "processing_max_s=%.6f map_callback_max_s=%.6f preprocess_max_s=%.6f "
+                "stage_n=%lu imu_mean_ms=%.2f imu_max_ms=%.2f fov_mean_ms=%.2f "
+                "voxel_mean_ms=%.2f match_mean_ms=%.2f match_max_ms=%.2f "
+                "insert_mean_ms=%.2f publish_mean_ms=%.2f",
                 diagnostic_now-diagnostic_last, diag_imu.count, diag_cloud.count,
                 diag_imu.count ? diag_imu.age_max : -1.0,
                 diag_cloud.count ? diag_cloud.age_max : -1.0,
@@ -1037,12 +1080,18 @@ private:
                 diag_imu.backwards, diag_cloud.backwards, imu_buffer.size(), lidar_buffer.size(),
                 time_buffer.size(), lidar_pushed ? lidar_end_time-last_timestamp_imu : 0.0,
                 diag_wait_empty, diag_wait_imu, diag_synced,
-                diag_timer_max, diag_map_max, diag_preprocess_max);
+                diag_timer_max, diag_map_max, diag_preprocess_max,
+                stage_match.count, stage_imu.mean()*1000, stage_imu.maximum*1000,
+                stage_fov.mean()*1000, stage_voxel.mean()*1000,
+                stage_match.mean()*1000, stage_match.maximum*1000,
+                stage_insert.mean()*1000, stage_publish.mean()*1000);
             diagnostic_last = diagnostic_now;
             diag_imu.age_max = diag_cloud.age_max = -1.0;
             diag_imu.gap_max = diag_cloud.gap_max = 0;
             diag_wait_empty = diag_wait_imu = diag_synced = 0;
             diag_timer_max = diag_map_max = diag_preprocess_max = 0;
+            stage_imu.reset(); stage_fov.reset(); stage_voxel.reset();
+            stage_match.reset(); stage_insert.reset(); stage_publish.reset();
         }
         if(sync_packages(Measures))
         {
@@ -1064,6 +1113,7 @@ private:
             t0 = omp_get_wtime();
 
             p_imu->Process(Measures, kf, feats_undistort);
+            stage_imu.add(omp_get_wtime() - t0);
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
 
@@ -1076,12 +1126,16 @@ private:
             flg_EKF_inited = (Measures.lidar_beg_time - first_lidar_time) < INIT_TIME ? \
                             false : true;
             /*** Segment the map in lidar FOV ***/
+            const double fov_start = omp_get_wtime();
             lasermap_fov_segment();
+            stage_fov.add(omp_get_wtime() - fov_start);
 
             /*** downsample the feature points in a scan ***/
+            const double voxel_start = omp_get_wtime();
             downSizeFilterSurf.setInputCloud(feats_undistort);
             downSizeFilterSurf.filter(*feats_down_body);
             t1 = omp_get_wtime();
+            stage_voxel.add(t1 - voxel_start);
             feats_down_size = feats_down_body->points.size();
             /*** initialize the map kdtree ***/
             if(ikdtree.Root_Node == nullptr)
@@ -1146,6 +1200,7 @@ private:
             geoQuat.w = state_point.rot.coeffs()[3];
 
             double t_update_end = omp_get_wtime();
+            stage_match.add(t_update_end - t_update_start);
 
             /******* Publish odometry *******/
             publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
@@ -1154,12 +1209,15 @@ private:
             t3 = omp_get_wtime();
             map_incremental();
             t5 = omp_get_wtime();
+            stage_insert.add(t5 - t3);
+            const double publish_start = omp_get_wtime();
             
             /******* Publish points *******/
             if (path_en)                         publish_path(pubPath_);
             if (scan_pub_en)      publish_frame_world(pubLaserCloudFull_);
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
             if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_);
+            stage_publish.add(omp_get_wtime() - publish_start);
             // if (map_pub_en) publish_map(pubLaserCloudMap_);
 
             /*** Debug variables ***/
@@ -1217,6 +1275,8 @@ private:
     }
 
 private:
+    bool separate_sensor_callbacks_ = false;
+    rclcpp::CallbackGroup::SharedPtr sensor_group_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect_;
@@ -1248,7 +1308,14 @@ int main(int argc, char** argv)
 
     signal(SIGINT, SigHandle);
 
-    rclcpp::spin(std::make_shared<LaserMappingNode>());
+    auto node = std::make_shared<LaserMappingNode>();
+    if (node->separate_sensor_callbacks()) {
+        rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 2);
+        executor.add_node(node);
+        executor.spin();
+    } else {
+        rclcpp::spin(node);
+    }
 
     if (rclcpp::ok())
         rclcpp::shutdown();
