@@ -57,6 +57,8 @@ class ImuProcess
   V3D cov_bias_gyr;
   V3D cov_bias_acc;
   double first_lidar_time;
+  /** Last bias-corrected gyro (body frame); filled by UndistortPcl. */
+  V3D angvel_last;
 
  private:
   void IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N);
@@ -72,7 +74,6 @@ class ImuProcess
   V3D Lidar_T_wrt_IMU;
   V3D mean_acc;
   V3D mean_gyr;
-  V3D angvel_last;
   V3D acc_s_last;
   double start_timestamp_;
   double last_lidar_end_time_;

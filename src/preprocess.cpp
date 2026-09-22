@@ -614,73 +614,71 @@ void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
     return;
   pl_surf.reserve(plsize);
 
-  /*** These variables only works when no point timestamps given ***/
-  double omega_l = 0.361 * SCAN_RATE;  // scan angular velocity
-  std::vector<bool> is_first(N_SCANS, true);
-  std::vector<double> yaw_fp(N_SCANS, 0.0);    // yaw of first scan point
-  std::vector<float> yaw_last(N_SCANS, 0.0);   // yaw of last scan point
-  std::vector<float> time_last(N_SCANS, 0.0);  // last offset time
-  /*****************************************************************/
-
-  given_offset_time = false;
-  double yaw_first = atan2(pl_orig.points[0].y, pl_orig.points[0].x) * 57.29578;
-  double yaw_end = yaw_first;
-  int layer_first = pl_orig.points[0].line;
-  for (uint i = plsize - 1; i > 0; i--)
+  // livox_ros_driver2 PointCloud2 stores absolute timestamps (ns as double).
+  // FAST-LIO curvature must be offset within the scan in milliseconds.
+  // Do NOT invent times from yaw — Mid-360 is not a spinning Velodyne.
+  double t_min = pl_orig.points[0].timestamp;
+  double t_max = t_min;
+  for (int i = 1; i < plsize; ++i)
   {
-    if (pl_orig.points[i].line == layer_first)
+    const double t = pl_orig.points[i].timestamp;
+    if (t < t_min)
+      t_min = t;
+    if (t > t_max)
+      t_max = t;
+  }
+  if (!(t_max > t_min))
+  {
+    // Degenerate: keep all points at t=0 rather than fabricating yaw times.
+    given_offset_time = true;
+    for (int i = 0; i < plsize; ++i)
     {
-      yaw_end = atan2(pl_orig.points[i].y, pl_orig.points[i].x) * 57.29578;
-      break;
+      if (i % point_filter_num != 0)
+        continue;
+      const auto &pt = pl_orig.points[i];
+      if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z))
+        continue;
+      if (pt.x * pt.x + pt.y * pt.y + pt.z * pt.z < blind * blind)
+        continue;
+      PointType added_pt;
+      added_pt.normal_x = 0;
+      added_pt.normal_y = 0;
+      added_pt.normal_z = 0;
+      added_pt.x = pt.x;
+      added_pt.y = pt.y;
+      added_pt.z = pt.z;
+      added_pt.intensity = pt.intensity;
+      added_pt.curvature = 0.0f;
+      pl_surf.push_back(added_pt);
     }
+    return;
   }
 
-  for (uint i = 0; i < plsize; ++i)
+  given_offset_time = true;
+  for (int i = 0; i < plsize; ++i)
   {
+    if (i % point_filter_num != 0)
+      continue;
+    const auto &pt = pl_orig.points[i];
+    if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z))
+      continue;
+    // Keep normal / high-confidence returns (same mask as Avia CustomMsg path).
+    if (!((pt.tag & 0x30) == 0x10 || (pt.tag & 0x30) == 0x00))
+      continue;
+    if (pt.x * pt.x + pt.y * pt.y + pt.z * pt.z < blind * blind)
+      continue;
+
     PointType added_pt;
     added_pt.normal_x = 0;
     added_pt.normal_y = 0;
     added_pt.normal_z = 0;
-    added_pt.x = pl_orig.points[i].x;
-    added_pt.y = pl_orig.points[i].y;
-    added_pt.z = pl_orig.points[i].z;
-    added_pt.intensity = pl_orig.points[i].reflectivity;
-    added_pt.curvature = 0.;
-
-    int layer = pl_orig.points[i].line;
-    double yaw_angle = atan2(added_pt.y, added_pt.x) * 57.2957;
-
-    if (is_first[layer])
-    {
-      // printf("layer: %d; is first: %d", layer, is_first[layer]);
-      yaw_fp[layer] = yaw_angle;
-      is_first[layer] = false;
-      added_pt.curvature = 0.0;
-      yaw_last[layer] = yaw_angle;
-      time_last[layer] = added_pt.curvature;
-      continue;
-    }
-
-    // compute offset time
-    if (yaw_angle <= yaw_fp[layer])
-    {
-      added_pt.curvature = (yaw_fp[layer] - yaw_angle) / omega_l;
-    }
-    else
-    {
-      added_pt.curvature = (yaw_fp[layer] - yaw_angle + 360.0) / omega_l;
-    }
-
-    if (added_pt.curvature < time_last[layer])
-      added_pt.curvature += 360.0 / omega_l;
-
-    yaw_last[layer] = yaw_angle;
-    time_last[layer] = added_pt.curvature;
-
-    if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
-    {
-      pl_surf.push_back(std::move(added_pt));
-    }
+    added_pt.x = pt.x;
+    added_pt.y = pt.y;
+    added_pt.z = pt.z;
+    added_pt.intensity = pt.intensity;
+    // timestamp_unit 3 (NS) → time_unit_scale = 1e-6 → curvature in ms.
+    added_pt.curvature = static_cast<float>((pt.timestamp - t_min) * time_unit_scale);
+    pl_surf.push_back(added_pt);
   }
 }
 
