@@ -74,6 +74,7 @@ double T1[MAXN], s_plot[MAXN], s_plot2[MAXN], s_plot3[MAXN], s_plot4[MAXN], s_pl
 double match_time = 0, solve_time = 0, solve_const_H_time = 0;
 int    kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0, kdtree_delete_counter = 0;
 bool   runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = true, path_en = true;
+bool   publish_tf_en = true;
 /**************************/
 
 float res_last[100000] = {0.0};
@@ -280,8 +281,40 @@ void lasermap_fov_segment()
     kdtree_delete_time = omp_get_wtime() - delete_begin;
 }
 
+// Diagnostic-only, opt-in. Accessed by the existing single-threaded executor.
+// Wall age assumes hardware epoch stamps; durations use a monotonic clock.
+struct InputDiagnostic {
+    unsigned long count = 0, backwards = 0;
+    double stamp = 0, arrival = 0, age_max = -1e30, gap_max = 0;
+    void observe(double value) {
+        const double now = omp_get_wtime();
+        if (count) {
+            gap_max = std::max(gap_max, now - arrival);
+            backwards += value < stamp;
+        }
+        stamp = value; arrival = now; ++count;
+        double wall = std::chrono::duration<double>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        age_max = std::max(age_max, wall - value);
+    }
+};
+bool diagnostics_enabled = false;
+InputDiagnostic diag_imu, diag_cloud;
+unsigned long diag_wait_empty = 0, diag_wait_imu = 0, diag_synced = 0;
+double diag_timer_max = 0, diag_map_max = 0, diag_preprocess_max = 0;
+struct DiagnosticDuration {
+    double &maximum;
+    double start;
+    explicit DiagnosticDuration(double &target) : maximum(target), start(omp_get_wtime()) {}
+    ~DiagnosticDuration() {
+        if (diagnostics_enabled) maximum = std::max(maximum, omp_get_wtime() - start);
+    }
+};
+
 void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg) 
 {
+    DiagnosticDuration duration(diag_preprocess_max);
+    if (diagnostics_enabled) diag_cloud.observe(get_time_sec(msg->header.stamp));
     mtx_buffer.lock();
     scan_count ++;
     double cur_time = get_time_sec(msg->header.stamp);
@@ -310,6 +343,8 @@ double timediff_lidar_wrt_imu = 0.0;
 bool   timediff_set_flg = false;
 void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg) 
 {
+    DiagnosticDuration duration(diag_preprocess_max);
+    if (diagnostics_enabled) diag_cloud.observe(get_time_sec(msg->header.stamp));
     mtx_buffer.lock();
     double cur_time = get_time_sec(msg->header.stamp);
     double preprocess_start_time = omp_get_wtime();
@@ -349,6 +384,7 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
 
 void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 {
+    if (diagnostics_enabled) diag_imu.observe(get_time_sec(msg_in->header.stamp));
     publish_count ++;
     // cout<<"IMU got at: "<<msg_in->header.stamp.toSec()<<endl;
     sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
@@ -383,6 +419,7 @@ int    scan_num = 0;
 bool sync_packages(MeasureGroup &meas)
 {
     if (lidar_buffer.empty() || imu_buffer.empty()) {
+        if (diagnostics_enabled) ++diag_wait_empty;
         return false;
     }
 
@@ -414,6 +451,7 @@ bool sync_packages(MeasureGroup &meas)
 
     if (last_timestamp_imu < lidar_end_time)
     {
+        if (diagnostics_enabled) ++diag_wait_imu;
         return false;
     }
 
@@ -431,6 +469,7 @@ bool sync_packages(MeasureGroup &meas)
     lidar_buffer.pop_front();
     time_buffer.pop_front();
     lidar_pushed = false;
+    if (diagnostics_enabled) ++diag_synced;
     return true;
 }
 
@@ -631,7 +670,17 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     odomAftMapped.child_frame_id = "body";
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
-    pubOdomAftMapped->publish(odomAftMapped);
+
+    // Twist in child_frame (body): ESIKF vel is world/camera_init; rotate into body.
+    // Angular rate from last IMU propagate (gyro - bias), already body-frame.
+    V3D vel_body = state_point.rot.conjugate() * state_point.vel;
+    odomAftMapped.twist.twist.linear.x = vel_body(0);
+    odomAftMapped.twist.twist.linear.y = vel_body(1);
+    odomAftMapped.twist.twist.linear.z = vel_body(2);
+    odomAftMapped.twist.twist.angular.x = p_imu->angvel_last(0);
+    odomAftMapped.twist.twist.angular.y = p_imu->angvel_last(1);
+    odomAftMapped.twist.twist.angular.z = p_imu->angvel_last(2);
+
     auto P = kf.get_P();
     for (int i = 0; i < 6; i ++)
     {
@@ -644,18 +693,23 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
         odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
     }
 
-    geometry_msgs::msg::TransformStamped trans;
-    trans.header.frame_id = "camera_init";
-    trans.child_frame_id = "body";
-    trans.header.stamp = get_ros_time(lidar_end_time);
-    trans.transform.translation.x = odomAftMapped.pose.pose.position.x;
-    trans.transform.translation.y = odomAftMapped.pose.pose.position.y;
-    trans.transform.translation.z = odomAftMapped.pose.pose.position.z;
-    trans.transform.rotation.w = odomAftMapped.pose.pose.orientation.w;
-    trans.transform.rotation.x = odomAftMapped.pose.pose.orientation.x;
-    trans.transform.rotation.y = odomAftMapped.pose.pose.orientation.y;
-    trans.transform.rotation.z = odomAftMapped.pose.pose.orientation.z;
-    tf_br->sendTransform(trans);
+    pubOdomAftMapped->publish(odomAftMapped);
+
+    if (publish_tf_en)
+    {
+        geometry_msgs::msg::TransformStamped trans;
+        trans.header.frame_id = "camera_init";
+        trans.child_frame_id = "body";
+        trans.header.stamp = get_ros_time(lidar_end_time);
+        trans.transform.translation.x = odomAftMapped.pose.pose.position.x;
+        trans.transform.translation.y = odomAftMapped.pose.pose.position.y;
+        trans.transform.translation.z = odomAftMapped.pose.pose.position.z;
+        trans.transform.rotation.w = odomAftMapped.pose.pose.orientation.w;
+        trans.transform.rotation.x = odomAftMapped.pose.pose.orientation.x;
+        trans.transform.rotation.y = odomAftMapped.pose.pose.orientation.y;
+        trans.transform.rotation.z = odomAftMapped.pose.pose.orientation.z;
+        tf_br->sendTransform(trans);
+    }
 }
 
 void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
@@ -798,12 +852,15 @@ class LaserMappingNode : public rclcpp::Node
 public:
     LaserMappingNode(const rclcpp::NodeOptions& options = rclcpp::NodeOptions()) : Node("laser_mapping", options)
     {
+        diagnostics_enabled = this->declare_parameter<bool>("diagnostics.enabled", false);
         this->declare_parameter<bool>("publish.path_en", true);
         this->declare_parameter<bool>("publish.effect_map_en", false);
         this->declare_parameter<bool>("publish.map_en", false);
         this->declare_parameter<bool>("publish.scan_publish_en", true);
         this->declare_parameter<bool>("publish.dense_publish_en", true);
         this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
+        // When false, slam_tf_bridge owns map/odom/body TFs (no camera_init→body).
+        this->declare_parameter<bool>("publish.publish_tf", true);
         this->declare_parameter<int>("max_iteration", 4);
         this->declare_parameter<string>("map_file_path", "");
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
@@ -840,6 +897,7 @@ public:
         this->get_parameter_or<bool>("publish.scan_publish_en", scan_pub_en, true);
         this->get_parameter_or<bool>("publish.dense_publish_en", dense_pub_en, true);
         this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
+        this->get_parameter_or<bool>("publish.publish_tf", publish_tf_en, true);
         this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
         this->get_parameter_or<string>("common.lid_topic", lid_topic, "/livox/lidar");
@@ -957,6 +1015,35 @@ public:
 private:
     void timer_callback()
     {
+        DiagnosticDuration duration(diag_timer_max);
+        const double diagnostic_now = omp_get_wtime();
+        static double diagnostic_last = diagnostic_now;
+        if (diagnostics_enabled && diagnostic_now - diagnostic_last >= 1.0) {
+            RCLCPP_INFO(this->get_logger(),
+                "LIO_DIAG interval_s=%.3f imu_total=%lu cloud_total=%lu "
+                "imu_age_max_s=%.6f cloud_age_max_s=%.6f "
+                "imu_gap_max_s=%.6f cloud_gap_max_s=%.6f "
+                "imu_silent_s=%.6f cloud_silent_s=%.6f "
+                "imu_backwards=%lu cloud_backwards=%lu imu_queue=%zu cloud_queue=%zu "
+                "time_queue=%zu imu_end_deficit_s=%.6f "
+                "wait_empty=%lu wait_imu=%lu synced=%lu "
+                "processing_max_s=%.6f map_callback_max_s=%.6f preprocess_max_s=%.6f",
+                diagnostic_now-diagnostic_last, diag_imu.count, diag_cloud.count,
+                diag_imu.count ? diag_imu.age_max : -1.0,
+                diag_cloud.count ? diag_cloud.age_max : -1.0,
+                diag_imu.gap_max, diag_cloud.gap_max,
+                diag_imu.count ? diagnostic_now-diag_imu.arrival : -1.0,
+                diag_cloud.count ? diagnostic_now-diag_cloud.arrival : -1.0,
+                diag_imu.backwards, diag_cloud.backwards, imu_buffer.size(), lidar_buffer.size(),
+                time_buffer.size(), lidar_pushed ? lidar_end_time-last_timestamp_imu : 0.0,
+                diag_wait_empty, diag_wait_imu, diag_synced,
+                diag_timer_max, diag_map_max, diag_preprocess_max);
+            diagnostic_last = diagnostic_now;
+            diag_imu.age_max = diag_cloud.age_max = -1.0;
+            diag_imu.gap_max = diag_cloud.gap_max = 0;
+            diag_wait_empty = diag_wait_imu = diag_synced = 0;
+            diag_timer_max = diag_map_max = diag_preprocess_max = 0;
+        }
         if(sync_packages(Measures))
         {
             if (flg_first_scan)
@@ -1109,6 +1196,7 @@ private:
 
     void map_publish_callback()
     {
+        DiagnosticDuration duration(diag_map_max);
         if (map_pub_en) publish_map(pubLaserCloudMap_);
     }
 
