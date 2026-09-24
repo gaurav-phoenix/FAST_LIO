@@ -284,27 +284,38 @@ void lasermap_fov_segment()
     kdtree_delete_time = omp_get_wtime() - delete_begin;
 }
 
-// Diagnostic-only, opt-in. Accessed by the existing single-threaded executor.
-// Wall age assumes hardware epoch stamps; durations use a monotonic clock.
+// Diagnostic-only, opt-in. Header age uses system time on hardware and /clock in replay.
+rclcpp::Clock::SharedPtr diagnostic_clock;
+double diagnostic_reference_now()
+{
+    if (diagnostic_clock) return diagnostic_clock->now().seconds();
+    return std::chrono::duration<double>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
 struct InputDiagnostic {
     unsigned long count = 0, backwards = 0;
-    double stamp = 0, arrival = 0, age_max = -1e30, gap_max = 0;
+    double stamp = 0, arrival = 0, age_max = -1e30;
+    double arrival_gap_max = 0, stamp_gap_max = 0;
     void observe(double value) {
         const double now = omp_get_wtime();
         if (count) {
-            gap_max = std::max(gap_max, now - arrival);
+            arrival_gap_max = std::max(arrival_gap_max, now - arrival);
+            stamp_gap_max = std::max(stamp_gap_max, value - stamp);
             backwards += value < stamp;
         }
         stamp = value; arrival = now; ++count;
-        double wall = std::chrono::duration<double>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        age_max = std::max(age_max, wall - value);
+        age_max = std::max(age_max, diagnostic_reference_now() - value);
     }
 };
 bool diagnostics_enabled = false;
 InputDiagnostic diag_imu, diag_cloud;
 unsigned long diag_wait_empty = 0, diag_wait_imu = 0, diag_synced = 0;
 double diag_timer_max = 0, diag_map_max = 0, diag_preprocess_max = 0;
+unsigned long diag_scan_count = 0, diag_scan_imu_samples = 0, diag_odom_count = 0;
+double diag_scan_imu_samples_max = 0, diag_scan_imu_stamp_gap_max = 0;
+double diag_scan_imu_end_deficit_max = 0, diag_odom_age_total = 0;
+double diag_odom_age_max = -1e30;
 struct StageTiming {
     double total = 0, maximum = 0;
     unsigned long count = 0;
@@ -494,6 +505,24 @@ bool sync_packages(MeasureGroup &meas)
         if(imu_time > lidar_end_time) break;
         meas.imu.push_back(imu_buffer.front());
         imu_buffer.pop_front();
+    }
+
+    if (diagnostics_enabled) {
+        ++diag_scan_count;
+        diag_scan_imu_samples += meas.imu.size();
+        diag_scan_imu_samples_max = std::max(diag_scan_imu_samples_max,
+                                             static_cast<double>(meas.imu.size()));
+        for (size_t index = 1; index < meas.imu.size(); ++index) {
+            const double previous = get_time_sec(meas.imu[index - 1]->header.stamp);
+            const double current = get_time_sec(meas.imu[index]->header.stamp);
+            diag_scan_imu_stamp_gap_max = std::max(diag_scan_imu_stamp_gap_max,
+                                                   current - previous);
+        }
+        if (!meas.imu.empty()) {
+            const double latest_imu = get_time_sec(meas.imu.back()->header.stamp);
+            diag_scan_imu_end_deficit_max = std::max(diag_scan_imu_end_deficit_max,
+                                                      lidar_end_time - latest_imu);
+        }
     }
 
     lidar_buffer.pop_front();
@@ -883,6 +912,7 @@ public:
     LaserMappingNode(const rclcpp::NodeOptions& options = rclcpp::NodeOptions()) : Node("laser_mapping", options)
     {
         diagnostics_enabled = this->declare_parameter<bool>("diagnostics.enabled", false);
+        diagnostic_clock = this->get_clock();
         separate_sensor_callbacks_ = this->declare_parameter<bool>("sensor_callbacks.concurrent", false);
         if (separate_sensor_callbacks_) {
             sensor_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -1020,7 +1050,23 @@ public:
         {
             sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk, sensor_options);
         }
-        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk, sensor_options);
+        const auto imu_qos_reliability = this->declare_parameter<std::string>(
+            "imu_subscription.reliability", "reliable");
+        const auto imu_qos_depth = this->declare_parameter<int>("imu_subscription.depth", 10);
+        if (imu_qos_depth <= 0) {
+            throw std::runtime_error("imu_subscription.depth must be greater than zero");
+        }
+        rclcpp::QoS imu_qos{rclcpp::KeepLast(imu_qos_depth)};
+        if (imu_qos_reliability == "reliable") {
+            imu_qos.reliable();
+        } else if (imu_qos_reliability == "best_effort") {
+            imu_qos.best_effort();
+        } else {
+            throw std::runtime_error("imu_subscription.reliability must be reliable or best_effort");
+        }
+        RCLCPP_INFO(this->get_logger(), "LIO_IMU_QOS reliability=%s depth=%ld",
+                    imu_qos_reliability.c_str(), static_cast<long>(imu_qos_depth));
+        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, imu_qos, imu_cbk, sensor_options);
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
@@ -1059,10 +1105,17 @@ private:
         if (diagnostics_enabled && diagnostic_now - diagnostic_last >= 1.0) {
             std::lock_guard<std::mutex> diag_lock(mtx_diag);
             std::lock_guard<std::mutex> buffer_lock(mtx_buffer);
+            const double ros_now = this->now().seconds();
+            const double imu_queue_oldest_age = imu_buffer.empty() ? -1.0 :
+                ros_now - get_time_sec(imu_buffer.front()->header.stamp);
+            const double cloud_queue_oldest_age = time_buffer.empty() ? -1.0 :
+                ros_now - time_buffer.front();
+            const double pending_scan_age = lidar_pushed ? ros_now - lidar_end_time : -1.0;
             RCLCPP_INFO(this->get_logger(),
                 "LIO_DIAG interval_s=%.3f imu_total=%lu cloud_total=%lu "
                 "imu_age_max_s=%.6f cloud_age_max_s=%.6f "
-                "imu_gap_max_s=%.6f cloud_gap_max_s=%.6f "
+                "imu_arrival_gap_max_s=%.6f cloud_arrival_gap_max_s=%.6f "
+                "imu_stamp_gap_max_s=%.6f cloud_stamp_gap_max_s=%.6f "
                 "imu_silent_s=%.6f cloud_silent_s=%.6f "
                 "imu_backwards=%lu cloud_backwards=%lu imu_queue=%zu cloud_queue=%zu "
                 "time_queue=%zu imu_end_deficit_s=%.6f "
@@ -1074,7 +1127,8 @@ private:
                 diagnostic_now-diagnostic_last, diag_imu.count, diag_cloud.count,
                 diag_imu.count ? diag_imu.age_max : -1.0,
                 diag_cloud.count ? diag_cloud.age_max : -1.0,
-                diag_imu.gap_max, diag_cloud.gap_max,
+                diag_imu.arrival_gap_max, diag_cloud.arrival_gap_max,
+                diag_imu.stamp_gap_max, diag_cloud.stamp_gap_max,
                 diag_imu.count ? diagnostic_now-diag_imu.arrival : -1.0,
                 diag_cloud.count ? diagnostic_now-diag_cloud.arrival : -1.0,
                 diag_imu.backwards, diag_cloud.backwards, imu_buffer.size(), lidar_buffer.size(),
@@ -1085,11 +1139,29 @@ private:
                 stage_fov.mean()*1000, stage_voxel.mean()*1000,
                 stage_match.mean()*1000, stage_match.maximum*1000,
                 stage_insert.mean()*1000, stage_publish.mean()*1000);
+            RCLCPP_INFO(this->get_logger(),
+                "LIO_DIAG_COVERAGE scans=%lu imu_samples_total=%lu "
+                "imu_samples_per_scan_mean=%.2f imu_samples_per_scan_max=%.0f "
+                "imu_scan_stamp_gap_max_s=%.6f imu_scan_end_deficit_max_s=%.6f "
+                "imu_queue_oldest_age_s=%.6f cloud_queue_oldest_age_s=%.6f "
+                "pending_scan_age_s=%.6f odom_age_mean_s=%.6f odom_age_max_s=%.6f",
+                diag_scan_count, diag_scan_imu_samples,
+                diag_scan_count ? static_cast<double>(diag_scan_imu_samples) / diag_scan_count : 0.0,
+                diag_scan_imu_samples_max, diag_scan_imu_stamp_gap_max,
+                diag_scan_imu_end_deficit_max, imu_queue_oldest_age, cloud_queue_oldest_age,
+                pending_scan_age,
+                diag_odom_count ? diag_odom_age_total / diag_odom_count : -1.0,
+                diag_odom_count ? diag_odom_age_max : -1.0);
             diagnostic_last = diagnostic_now;
             diag_imu.age_max = diag_cloud.age_max = -1.0;
-            diag_imu.gap_max = diag_cloud.gap_max = 0;
+            diag_imu.arrival_gap_max = diag_cloud.arrival_gap_max = 0;
+            diag_imu.stamp_gap_max = diag_cloud.stamp_gap_max = 0;
             diag_wait_empty = diag_wait_imu = diag_synced = 0;
             diag_timer_max = diag_map_max = diag_preprocess_max = 0;
+            diag_scan_count = diag_scan_imu_samples = diag_odom_count = 0;
+            diag_scan_imu_samples_max = diag_scan_imu_stamp_gap_max = 0;
+            diag_scan_imu_end_deficit_max = diag_odom_age_total = 0;
+            diag_odom_age_max = -1.0;
             stage_imu.reset(); stage_fov.reset(); stage_voxel.reset();
             stage_match.reset(); stage_insert.reset(); stage_publish.reset();
         }
@@ -1204,6 +1276,12 @@ private:
 
             /******* Publish odometry *******/
             publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+            if (diagnostics_enabled) {
+                const double odom_age = this->now().seconds() - Measures.lidar_end_time;
+                ++diag_odom_count;
+                diag_odom_age_total += odom_age;
+                diag_odom_age_max = std::max(diag_odom_age_max, odom_age);
+            }
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
