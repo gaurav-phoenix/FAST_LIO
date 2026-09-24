@@ -38,6 +38,7 @@
 #include <math.h>
 #include <thread>
 #include <fstream>
+#include <cstdio>
 #include <csignal>
 #include <chrono>
 #include <unistd.h>
@@ -313,6 +314,7 @@ InputDiagnostic diag_imu, diag_cloud;
 unsigned long diag_wait_empty = 0, diag_wait_imu = 0, diag_synced = 0;
 double diag_timer_max = 0, diag_map_max = 0, diag_preprocess_max = 0;
 unsigned long diag_scan_count = 0, diag_scan_imu_samples = 0, diag_odom_count = 0;
+unsigned long diag_odom_total = 0;
 double diag_scan_imu_samples_max = 0, diag_scan_imu_stamp_gap_max = 0;
 double diag_scan_imu_end_deficit_max = 0, diag_odom_age_total = 0;
 double diag_odom_age_max = -1e30;
@@ -1089,6 +1091,21 @@ public:
 
     bool separate_sensor_callbacks() const { return separate_sensor_callbacks_; }
 
+    // This path must not depend on a final /clock tick: bag playback stops that
+    // clock before the process is asked to exit.
+    void log_final_diagnostics()
+    {
+        if (!diagnostics_enabled) return;
+        std::lock_guard<std::mutex> diag_lock(mtx_diag);
+        std::lock_guard<std::mutex> buffer_lock(mtx_buffer);
+        std::fprintf(stderr,
+            "LIO_DIAG_FINAL imu_total=%lu cloud_total=%lu odom_total=%lu "
+            "imu_queue=%zu cloud_queue=%zu time_queue=%zu\n",
+            diag_imu.count, diag_cloud.count, diag_odom_total,
+            imu_buffer.size(), lidar_buffer.size(), time_buffer.size());
+        std::fflush(stderr);
+    }
+
     ~LaserMappingNode()
     {
         fout_out.close();
@@ -1279,6 +1296,7 @@ private:
             if (diagnostics_enabled) {
                 const double odom_age = this->now().seconds() - Measures.lidar_end_time;
                 ++diag_odom_count;
+                ++diag_odom_total;
                 diag_odom_age_total += odom_age;
                 diag_odom_age_max = std::max(diag_odom_age_max, odom_age);
             }
@@ -1395,6 +1413,7 @@ int main(int argc, char** argv)
         rclcpp::spin(node);
     }
 
+    node->log_final_diagnostics();
     if (rclcpp::ok())
         rclcpp::shutdown();
     /**************** save map ****************/
