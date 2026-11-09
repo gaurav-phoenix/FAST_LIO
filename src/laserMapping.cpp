@@ -1020,7 +1020,14 @@ public:
         {
             sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk, sensor_options);
         }
-        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk, sensor_options);
+        // A reliable reader that falls behind the Livox driver's KEEP_LAST(256) IMU writer can stay
+        // ~256 samples (1.28 s) behind at a fraction of 200 Hz; best effort always takes live samples.
+        const bool imu_best_effort = this->declare_parameter<bool>("sensor_callbacks.imu_best_effort", false);
+        rclcpp::QoS imu_qos(rclcpp::KeepLast(imu_best_effort ? 100 : 10));
+        if (imu_best_effort) {
+            imu_qos.best_effort();
+        }
+        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, imu_qos, imu_cbk, sensor_options);
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);

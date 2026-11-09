@@ -13,6 +13,7 @@
             enabled: true
         sensor_callbacks:
             concurrent: true
+            imu_best_effort: true  # avoid reliable-reader lag on the Livox IMU
         map_file_path: "./p30_hardware_map.pcd"
 
         common:
